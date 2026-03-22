@@ -4,6 +4,8 @@ import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase'
 import Sidebar from '@/components/ui/Sidebar'
 import ToastContainer, { toast } from '@/components/ui/Toast'
+import SyncIndicator from '@/components/ui/SyncIndicator'
+import { useOfflineSync, saveOffline } from '@/hooks/useOfflineSync'
 import {
   DISTRICTS, District, ServiceEntry, ServiceDay,
   emptyEntry, calcEntry, getServiceDates, getMonthKey,
@@ -26,7 +28,12 @@ function Num({ label, value, onChange, ro }: {
 }
 
 const DAY_LABELS: Record<ServiceDay, string> = {
-  sunday: '☀ Sunday', monday: '📖 Monday (Bible Study)', thursday: '🔥 Thursday (Revival)'
+  sunday: '☀ Sunday Worship',
+  monday: '📖 Monday Bible Study',
+  thursday: '🔥 Thursday Revival'
+}
+const DAY_COLORS: Record<ServiceDay, string> = {
+  sunday: '#7C3AED', monday: '#2563EB', thursday: '#D97706'
 }
 
 export default function EntryPage() {
@@ -44,6 +51,7 @@ export default function EntryPage() {
   const [submittedDates, setSubmittedDates] = useState<string[]>([])
 
   const now = new Date()
+  const { status, pendingCount, sync, checkPending } = useOfflineSync(userEmail)
 
   useEffect(() => {
     async function load() {
@@ -60,7 +68,6 @@ export default function EntryPage() {
       setSelectedDistrict(active)
       const mk = getMonthKey(now.getFullYear(), now.getMonth() + 1)
       setMonthKey(mk)
-      // Load submitted dates for this district
       await loadSubmitted(active, mk, supabase)
       setLoading(false)
     }
@@ -85,8 +92,7 @@ export default function EntryPage() {
     const { data } = await supabase
       .from('service_entries').select('*')
       .eq('district', selectedDistrict)
-      .eq('service_date', date)
-      .limit(1)
+      .eq('service_date', date).limit(1)
     if (data && data.length > 0) {
       setEntry(data[0])
     } else {
@@ -104,14 +110,30 @@ export default function EntryPage() {
   async function save() {
     if (!entry || !selectedDate) { toast('Please select a service date', 'warn'); return }
     setSaving(true)
-    const supabase = createClient()
-    const { data: { session } } = await supabase.auth.getSession()
-    const payload = { ...entry, district: selectedDistrict, submitted_by: session?.user?.email, submitted_at: new Date().toISOString() }
-    const { error } = await supabase.from('service_entries').upsert(payload, { onConflict: 'district,service_date' })
-    if (error) toast('Error: ' + error.message, 'error')
-    else {
-      toast(`${selectedDistrict} — ${selectedDate} saved!`)
-      await loadSubmitted(selectedDistrict, monthKey)
+    const payload = { ...entry, district: selectedDistrict, submitted_by: userEmail, submitted_at: new Date().toISOString() }
+
+    if (navigator.onLine) {
+      // Online — save directly to Supabase
+      const supabase = createClient()
+      const { error } = await supabase
+        .from('service_entries')
+        .upsert(payload, { onConflict: 'district,service_date' })
+      if (error) {
+        // Supabase failed — save offline as backup
+        await saveOffline(payload)
+        await checkPending()
+        toast('Saved offline (will sync when connection improves)', 'warn')
+      } else {
+        toast(`${selectedDistrict} — ${selectedDate} saved!`)
+        await loadSubmitted(selectedDistrict, monthKey)
+      }
+    } else {
+      // Offline — save to IndexedDB
+      await saveOffline(payload)
+      await checkPending()
+      toast('Saved offline — will sync when back online', 'warn')
+      // Optimistically add to submitted list
+      setSubmittedDates(prev => [...new Set([...prev, selectedDate])])
     }
     setSaving(false)
   }
@@ -122,40 +144,63 @@ export default function EntryPage() {
   const { year, month } = parseMonthKey(monthKey || getMonthKey(now.getFullYear(), now.getMonth() + 1))
   const serviceDates = getServiceDates(year, month)
   const T = entry ? calcEntry(entry) : null
-
-  const dayColor: Record<ServiceDay, string> = {
-    sunday: '#7C3AED', monday: 'var(--blue)', thursday: 'var(--gold)'
-  }
+  const color = DAY_COLORS[selectedDay]
 
   return (
     <div className="shell">
-      <Sidebar userRole={userRole} userDistrict={userDistrict} userEmail={userEmail} />
+      <Sidebar userRole={userRole} userDistrict={userDistrict} userEmail={userEmail} pendingCount={pendingCount} />
       <div className="main">
         <div className="topbar">
-          <Sidebar userRole={userRole} userDistrict={userDistrict} userEmail={userEmail} />
+          <Sidebar userRole={userRole} userDistrict={userDistrict} userEmail={userEmail} pendingCount={pendingCount} />
           <div className="topbar-title">
-            <h1>Enter Report — {selectedDistrict}</h1>
-            <p>{MONTH_NAMES[month - 1]} {year}</p>
+            <h1>Enter Report</h1>
+            <p>{selectedDistrict} · {MONTH_NAMES[month-1]} {year}</p>
           </div>
           <div className="topbar-actions">
-            <button onClick={() => router.push('/dashboard')}>← Back</button>
+            <SyncIndicator status={status} pendingCount={pendingCount} onSync={sync} />
+            <button className="hide-xs" onClick={() => router.push('/dashboard')}>← Back</button>
             {entry && selectedDate && (
               <button className="btn-primary" onClick={save} disabled={saving}>
-                {saving ? 'Saving…' : '✓ Save'}
+                {saving ? 'Saving…' : status === 'offline' ? '💾 Save Offline' : '✓ Save'}
               </button>
             )}
           </div>
         </div>
 
         <div className="page">
-          {/* District selector — admin only */}
+          {/* Offline banner */}
+          {status === 'offline' && (
+            <div className="alert alert-warn" style={{ marginBottom: '1rem' }}>
+              <span>📵</span>
+              <div>
+                <strong>You are offline.</strong> Reports will be saved to your device and automatically synced when you reconnect.
+                {pendingCount > 0 && ` You have ${pendingCount} unsaved report${pendingCount > 1 ? 's' : ''} waiting to sync.`}
+              </div>
+            </div>
+          )}
+
+          {/* Pending sync banner */}
+          {status === 'online' && pendingCount > 0 && (
+            <div className="alert alert-info" style={{ marginBottom: '1rem' }}>
+              <span>🔄</span>
+              <div>
+                <strong>{pendingCount} offline report{pendingCount > 1 ? 's' : ''} ready to sync.</strong>
+                <button onClick={sync} style={{ marginLeft: '12px', fontSize: '12px', padding: '3px 10px', background: 'var(--blue)', color: 'white', border: 'none', borderRadius: '20px', cursor: 'pointer' }}>
+                  Sync now
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* District selector */}
           {isAdmin && (
-            <div className="card" style={{ marginBottom: '1rem' }}>
+            <div className="card">
               <div className="card-head"><h3>Select District</h3></div>
               <div className="card-body">
                 <div className="district-tabs">
                   {DISTRICTS.map(d => (
-                    <button key={d} className={`district-tab ${selectedDistrict === d ? 'active' : ''}`}
+                    <button key={d}
+                      className={`district-tab ${selectedDistrict === d ? 'active' : ''}`}
                       onClick={() => { setSelectedDistrict(d); setSelectedDate(''); setEntry(null); loadSubmitted(d, monthKey) }}>
                       <span className={`dot ${submittedDates.length > 0 ? 'dot-on' : 'dot-off'}`} />
                       {d}
@@ -170,22 +215,30 @@ export default function EntryPage() {
           <div className="card">
             <div className="card-head">
               <h3>Select Service Date</h3>
-              <span className="badge badge-blue">{submittedDates.length} of {serviceDates.length} submitted</span>
+              <span className="badge badge-blue">{submittedDates.length}/{serviceDates.length} submitted</span>
             </div>
             <div className="card-body">
+              {/* Legend */}
+              <div style={{ display: 'flex', gap: '12px', marginBottom: '10px', flexWrap: 'wrap' }}>
+                {(['sunday','monday','thursday'] as ServiceDay[]).map(d => (
+                  <div key={d} style={{ display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px', color: DAY_COLORS[d], fontWeight: 600 }}>
+                    <span style={{ width: '10px', height: '10px', borderRadius: '50%', background: DAY_COLORS[d], display: 'inline-block' }} />
+                    {d.charAt(0).toUpperCase() + d.slice(1)}
+                  </div>
+                ))}
+              </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                 {serviceDates.map(sd => {
                   const done = submittedDates.includes(sd.date)
                   const selected = selectedDate === sd.date
-                  const color = dayColor[sd.day]
+                  const c = DAY_COLORS[sd.day]
                   return (
-                    <button key={sd.date}
-                      onClick={() => selectDate(sd.date, sd.day)}
+                    <button key={sd.date} onClick={() => selectDate(sd.date, sd.day)}
                       style={{
                         padding: '7px 14px', fontSize: '12px', fontWeight: 600,
-                        background: selected ? color : done ? `${color}15` : 'white',
-                        color: selected ? 'white' : done ? color : 'var(--gray-500)',
-                        borderColor: selected ? color : done ? color : 'var(--gray-200)',
+                        background: selected ? c : done ? `${c}15` : 'white',
+                        color: selected ? 'white' : done ? c : 'var(--gray-500)',
+                        borderColor: selected ? c : done ? c : 'var(--gray-200)',
                         borderRadius: 'var(--radius)',
                       }}>
                       {done && !selected ? '✓ ' : ''}{sd.label}
@@ -197,96 +250,105 @@ export default function EntryPage() {
           </div>
 
           {/* Entry form */}
-          {entry && selectedDate && (
-            <>
-              <div className="card">
-                <div className="card-head" style={{ background: `${dayColor[selectedDay]}15`, borderColor: `${dayColor[selectedDay]}30` }}>
-                  <h3 style={{ color: dayColor[selectedDay] }}>{DAY_LABELS[selectedDay]}</h3>
-                  <span style={{ fontSize: '12px', color: 'var(--gray-500)' }}>{selectedDate}</span>
+          {entry && selectedDate ? (
+            <div className="card">
+              <div className="card-head" style={{ background: `${color}10`, borderColor: `${color}30` }}>
+                <div>
+                  <h3 style={{ color }}>{DAY_LABELS[selectedDay]}</h3>
+                  <p style={{ fontSize: '12px' }}>{selectedDate} · {selectedDistrict}</p>
                 </div>
-                <div className="card-body">
-                  {/* HCF — Sunday only */}
-                  {selectedDay === 'sunday' && (
-                    <>
-                      <div className="section-title">📋 HCF Report</div>
-                      <div className="grid-3">
-                        <Num label="No. of HCF" value={entry.hcf_count || 0} onChange={v => sf('hcf_count', v)} />
-                        <Num label="No. Present" value={entry.hcf_present || 0} onChange={v => sf('hcf_present', v)} />
-                        <Num label="New Comers" value={entry.hcf_new_comers || 0} onChange={v => sf('hcf_new_comers', v)} />
-                      </div>
-                      <hr className="section-divider" />
-                    </>
-                  )}
-
-                  {/* Adults */}
-                  <div className="section-title">👥 Adults</div>
-                  <div className="grid-3">
-                    <Num label="Men" value={entry.adult_men} onChange={v => sf('adult_men', v)} />
-                    <Num label="Women" value={entry.adult_women} onChange={v => sf('adult_women', v)} />
-                    <Num label="Total" value={T?.adults || 0} ro />
-                  </div>
-
-                  {/* Youth */}
-                  <div className="section-title" style={{ marginTop: '0.875rem' }}>🧑 Youth</div>
-                  <div className="grid-3">
-                    <Num label="Boys" value={entry.youth_boys} onChange={v => sf('youth_boys', v)} />
-                    <Num label="Girls" value={entry.youth_girls} onChange={v => sf('youth_girls', v)} />
-                    <Num label="Total" value={T?.youth || 0} ro />
-                  </div>
-
-                  {/* Children */}
-                  <div className="section-title" style={{ marginTop: '0.875rem' }}>👦 Children</div>
-                  <div className="grid-3">
-                    <Num label="Boys" value={entry.children_boys} onChange={v => sf('children_boys', v)} />
-                    <Num label="Girls" value={entry.children_girls} onChange={v => sf('children_girls', v)} />
-                    <Num label="Total" value={T?.children || 0} ro />
-                  </div>
-
-                  {/* Subtotal — Sunday only */}
-                  {selectedDay === 'sunday' && T && (
-                    <div className="subtotal-box">
-                      <span>Sub-Total (All Attendance)</span>
-                      <strong>{T.subtotal}</strong>
+                {status === 'offline' && (
+                  <span className="badge badge-gold">📵 Offline mode</span>
+                )}
+              </div>
+              <div className="card-body">
+                {/* HCF — Sunday only */}
+                {selectedDay === 'sunday' && (
+                  <>
+                    <div className="section-title">📋 HCF Report</div>
+                    <div className="grid-3">
+                      <Num label="No. of HCF" value={entry.hcf_count || 0} onChange={v => sf('hcf_count', v)} />
+                      <Num label="No. Present" value={entry.hcf_present || 0} onChange={v => sf('hcf_present', v)} />
+                      <Num label="New Comers" value={entry.hcf_new_comers || 0} onChange={v => sf('hcf_new_comers', v)} />
                     </div>
-                  )}
+                    <hr className="section-divider" />
+                  </>
+                )}
 
-                  {/* Offerings */}
-                  <hr className="section-divider" />
-                  <div className="section-title">💰 Offerings</div>
-                  <div className="grid-2">
-                    <div className="offering-box">
-                      <label>Tithes & Offering (₦)</label>
-                      <input type="number" min={0}
-                        value={entry.tithes_offering === 0 ? '' : entry.tithes_offering}
-                        placeholder="0"
-                        onChange={e => sf('tithes_offering', parseInt(e.target.value) || 0)}
-                      />
-                    </div>
-                    <div className="offering-box">
-                      <label>Special Offering (₦)</label>
-                      <input type="number" min={0}
-                        value={entry.special_offering === 0 ? '' : entry.special_offering}
-                        placeholder="0"
-                        onChange={e => sf('special_offering', parseInt(e.target.value) || 0)}
-                      />
-                    </div>
-                  </div>
+                {/* Adults */}
+                <div className="section-title">👥 Adults</div>
+                <div className="grid-3">
+                  <Num label="Men" value={entry.adult_men} onChange={v => sf('adult_men', v)} />
+                  <Num label="Women" value={entry.adult_women} onChange={v => sf('adult_women', v)} />
+                  <Num label="Total" value={T?.adults || 0} ro />
                 </div>
-                <div className="card-footer">
-                  <button onClick={() => { setSelectedDate(''); setEntry(null) }}>Cancel</button>
-                  <button className="btn-primary" onClick={save} disabled={saving} style={{ padding: '10px 28px' }}>
-                    {saving ? 'Saving…' : '✓ Save Report'}
-                  </button>
+
+                {/* Youth */}
+                <div className="section-title" style={{ marginTop: '0.875rem' }}>🧑 Youth</div>
+                <div className="grid-3">
+                  <Num label="Boys" value={entry.youth_boys} onChange={v => sf('youth_boys', v)} />
+                  <Num label="Girls" value={entry.youth_girls} onChange={v => sf('youth_girls', v)} />
+                  <Num label="Total" value={T?.youth || 0} ro />
+                </div>
+
+                {/* Children */}
+                <div className="section-title" style={{ marginTop: '0.875rem' }}>👦 Children</div>
+                <div className="grid-3">
+                  <Num label="Boys" value={entry.children_boys} onChange={v => sf('children_boys', v)} />
+                  <Num label="Girls" value={entry.children_girls} onChange={v => sf('children_girls', v)} />
+                  <Num label="Total" value={T?.children || 0} ro />
+                </div>
+
+                {/* Subtotal — Sunday only */}
+                {selectedDay === 'sunday' && T && (
+                  <div className="subtotal-box">
+                    <span>Sub-Total (All Attendance)</span>
+                    <strong>{T.subtotal}</strong>
+                  </div>
+                )}
+
+                {/* Offerings */}
+                <hr className="section-divider" />
+                <div className="section-title">💰 Offerings</div>
+                <div className="grid-2">
+                  <div className="offering-box">
+                    <label>Tithes & Offering (₦)</label>
+                    <input type="number" min={0}
+                      value={entry.tithes_offering === 0 ? '' : entry.tithes_offering}
+                      placeholder="0"
+                      onChange={e => sf('tithes_offering', parseInt(e.target.value) || 0)}
+                    />
+                  </div>
+                  <div className="offering-box">
+                    <label>Special Offering (₦)</label>
+                    <input type="number" min={0}
+                      value={entry.special_offering === 0 ? '' : entry.special_offering}
+                      placeholder="0"
+                      onChange={e => sf('special_offering', parseInt(e.target.value) || 0)}
+                    />
+                  </div>
                 </div>
               </div>
-            </>
-          )}
-
-          {!selectedDate && (
+              <div className="card-footer">
+                <button onClick={() => { setSelectedDate(''); setEntry(null) }}>Cancel</button>
+                <button className="btn-primary" onClick={save} disabled={saving}
+                  style={{ padding: '10px 28px' }}>
+                  {saving ? 'Saving…' : status === 'offline' ? '💾 Save Offline' : '✓ Save Report'}
+                </button>
+              </div>
+            </div>
+          ) : (
             <div style={{ textAlign: 'center', padding: '3rem', color: 'var(--gray-400)' }}>
               <div style={{ fontSize: '40px', marginBottom: '0.75rem' }}>📅</div>
-              <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--gray-600)' }}>Select a service date above</div>
-              <div style={{ fontSize: '13px', marginTop: '4px' }}>Choose any Sunday, Monday, or Thursday to enter the report</div>
+              <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--gray-600)' }}>
+                Select a service date above
+              </div>
+              <div style={{ fontSize: '13px', marginTop: '4px' }}>
+                {status === 'offline'
+                  ? 'You are offline — reports will be saved locally and synced later'
+                  : 'Choose any Sunday, Monday, or Thursday to enter the report'
+                }
+              </div>
             </div>
           )}
         </div>
