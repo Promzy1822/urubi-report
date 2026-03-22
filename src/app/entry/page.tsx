@@ -75,7 +75,7 @@ export default function EntryPage() {
     const { data } = await supabase
       .from('service_entries').select('service_date')
       .eq('district', district).eq('month', mk)
-    setSubmittedDates((data || []).map((r: ServiceEntry) => r.service_date))
+    setSubmittedDates((data || []).map((r: { service_date: string }) => r.service_date))
   }, [])
 
   async function selectDate(date: string, day: ServiceDay) {
